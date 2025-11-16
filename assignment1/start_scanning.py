@@ -14,6 +14,10 @@ def normalize_angle(angle):
     """Normalizza l'angolo in [-pi, pi]."""
     return math.atan2(math.sin(angle), math.cos(angle))
 
+def angle_difference(a, b):
+        """Differenza normalizzata a - b (risultato in [-pi, pi])."""
+        return normalize_angle(a - b)
+
 class ScanMarkers(Node):
     def __init__(self):
         super().__init__('scan_markers')
@@ -24,7 +28,7 @@ class ScanMarkers(Node):
             Odometry,
             '/odom',
             self.odom,
-            10
+            100
         )
         self.markers_sub = self.create_subscription(
             ArucoDetection,
@@ -49,13 +53,13 @@ class ScanMarkers(Node):
             py = marker.pose.position.y
             pz = marker.pose.position.z
 
-            if px == 0 and py == 0 and px == 0:
+            if px == 0 and py == 0 and pz == 0:
                 continue
             
             angle_cam = math.atan2(px, pz)
             
-            #global_yaw = normalize_angle(self.yaw + angle_cam + camera_mounting_offset)
-            global_yaw = normalize_angle(self.yaw + angle_cam)
+            camera_mounting_offset = 0.0
+            global_yaw = normalize_angle(self.yaw + angle_cam + camera_mounting_offset)
             score = abs(angle_cam)  # più piccolo = più centrato
 
             prev = self.markers.get(marker_id)
@@ -76,6 +80,10 @@ class ScanMarkers(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
             wait_count += 1
             
+        if self.yaw is None:
+            self.get_logger().error('No odom received, aborting.')
+            return
+            
         twist = Twist()
         twist.linear.x = 0.0
         twist.angular.z = angular_speed
@@ -89,28 +97,41 @@ class ScanMarkers(Node):
         except KeyboardInterrupt:
             twist.angular.z = 0.0
             self.vel_pub.publish(twist)
+            self.get_logger().info('Interrupted during rotation.')
             pass
 
         twist.angular.z = 0.0
         self.vel_pub.publish(twist)
-        
         self.get_logger().info('SCANNING COMPLETED!')
-        self.destroy_subscription(self.markers_sub)
+        
+        try:
+            self.destroy_subscription(self.markers_sub)
+        except Exception:
+            pass
+
 
         time.sleep(5)        
         try:
-            threshold = 0.25
+            threshold = 0.1
             while len(self.markers) != 0:
                 lowest_id = min(self.markers.keys())
                 marker_yaw = self.markers[lowest_id][0]
                 self.get_logger().info(f'Aligning to marker {lowest_id} (target yaw={math.degrees(marker_yaw):.1f}°)')
+                
                 twist.angular.z = angular_speed
                 while True:
-                    self.vel_pub.publish(twist)
-                    self.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')
-                    if (abs(self.yaw - marker_yaw) <= threshold):
+                    rclpy.spin_once(self, timeout_sec=0.01)
+                    
+                    delta = normalize_angle(marker_yaw - self.yaw)  # target - current
+                    if abs(delta) <= threshold:
                         break
-                    rclpy.spin_once(self, timeout_sec=0.0)
+                    
+                    #if (abs(self.yaw - marker_yaw) <= threshold):
+                    #    break
+                    
+                    twist.angular.z = angular_speed if delta > 0.0 else -angular_speed
+                    self.vel_pub.publish(twist)
+                    self.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')                    
                     
                 twist.angular.z = 0.0
                 self.vel_pub.publish(twist)
@@ -120,6 +141,7 @@ class ScanMarkers(Node):
         except KeyboardInterrupt:
             twist.angular.z = 0.0
             self.vel_pub.publish(twist)
+            self.get_logger().info('Interrupted during alignment.')
             pass
         print("TASK COMPLETED!")
         

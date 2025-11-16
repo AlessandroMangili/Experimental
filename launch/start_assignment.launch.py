@@ -1,13 +1,11 @@
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, RegisterEventHandler, TimerAction
+from launch.actions import IncludeLaunchDescription, TimerAction, LogInfo, ExecuteProcess
 from launch.launch_description_sources import PythonLaunchDescriptionSource, AnyLaunchDescriptionSource
-from launch_ros.actions import Node
-from launch.event_handlers import OnProcessStart
 from ament_index_python.packages import get_package_share_directory
 import os
 
 def generate_launch_description():
-    # Percorso al launch file spawn_robot
+    # Include del launch che spawn del robot
     spawn_robot_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(
@@ -18,7 +16,7 @@ def generate_launch_description():
         )
     )
 
-    # Percorso al launch file aruco_tracker
+    # Include del launch aruco
     aruco_tracker_launch = IncludeLaunchDescription(
         AnyLaunchDescriptionSource(
             os.path.join(
@@ -29,36 +27,30 @@ def generate_launch_description():
         )
     )
 
-    # Nodo start_scanning, verrà lanciato dopo che i due launch precedenti sono avviati
-    start_scanning_node = Node(
-        package='assignment1',
-        executable='start_scanning',
-        name='start_scanning',
+    # Nodo start_scanning in un nuovo terminale
+    start_scanning_terminal = ExecuteProcess(
+        cmd=[
+            'gnome-terminal', '--',  # apre un nuovo terminale (GNOME)
+            'ros2', 'run', 'assignment1', 'start_scanning'
+        ],
         output='screen'
     )
 
-    # Sequenza: spawn_robot → aruco_tracker → start_scanning
-    # Primo evento: quando spawn_robot parte, lancio aruco_tracker
-    aruco_tracker_handler = RegisterEventHandler(
-        OnProcessStart(
-            target_action=spawn_robot_launch,
-            on_start=[aruco_tracker_launch]
-        )
-    )
-
-    # Secondo evento: quando aruco_tracker parte, lancio start_scanning
-    start_scanning_handler = RegisterEventHandler(
-        OnProcessStart(
-            target_action=aruco_tracker_launch,
-            on_start=[
-                # Piccola attesa per sicurezza (ad esempio 2 secondi)
-                TimerAction(period=2.0, actions=[start_scanning_node])
+    # Sequenza usando TimerAction
+    sequence = [
+        spawn_robot_launch,
+        LogInfo(msg='spawn_robot launched, scheduling aruco_tracker in 2s'),
+        TimerAction(
+            period=2.0,
+            actions=[
+                aruco_tracker_launch,
+                LogInfo(msg='aruco_tracker launched, scheduling start_scanning in new terminal in 2s'),
+                TimerAction(
+                    period=2.0,
+                    actions=[start_scanning_terminal]
+                )
             ]
         )
-    )
+    ]
 
-    return LaunchDescription([
-        spawn_robot_launch,
-        aruco_tracker_handler,
-        start_scanning_handler
-    ])
+    return LaunchDescription(sequence)
