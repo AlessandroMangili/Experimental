@@ -5,6 +5,9 @@ from nav_msgs.msg import Odometry
 from aruco_opencv_msgs.msg import ArucoDetection
 import math
 import time
+from cv_bridge import CvBridge
+import cv2
+from sensor_msgs.msg import Image
 
 def quaternion_to_yaw(x, y, z, w):
     """Convert quaternion to yaw (rotation around Z axis)"""
@@ -17,10 +20,14 @@ def normalize_angle(angle):
 class ScanMarkers(Node):
     def __init__(self):
         super().__init__('scan_markers')
-        self.vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.markers = {}                                               # [id marker] = Robot's angle after detecting the marker
         self.yaw = None                                                 # Current robot yaw orientation
         self.expected_markers = 5                                       # Number of markes expected
+        self.bridge = CvBridge()
+        self.cv_image = None                                            # Used to save the image already converted into a cv image
+        self.header = None
+        self.vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.image_pub = self.create_publisher(Image, 'camera/image_with_circle', 10)
         self.odom_sub = self.create_subscription(
             Odometry,
             '/odom',
@@ -33,7 +40,13 @@ class ScanMarkers(Node):
             self.marker_detection,
             10
         )
-        
+        self.image_sub = self.create_subscription(                      # Subscriber to the original camera topic
+            Image, 
+            'camera/image', 
+            self.image_callback, 
+            10
+        )
+
     def odom(self, msg):
         """Perform the robot yaw orientation"""
         q = msg.pose.pose.orientation
@@ -68,6 +81,14 @@ class ScanMarkers(Node):
                 self.markers[marker_id] = (global_yaw, score)
                 #self.get_logger().info(f'Best pose for marker {marker_id} updated: angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
                 
+    def image_callback(self, msg):
+        try:
+            # Convert ROS Image to OpenCV image
+            self.cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self.header = msg.header
+        except Exception as e:
+            self.get_logger().error(f'cv_bridge exception: {e}')
+                
     def _safe_publish(self, twist):
         """Publish twist only if context still valid"""
         try:
@@ -75,13 +96,31 @@ class ScanMarkers(Node):
                 self.vel_pub.publish(twist)
         except Exception as e:
             self.get_logger().warning(f'Publish failed: {e}')
+            
+    def draw_circle(self, id):
+        if self.cv_image is None:
+            self.get_logger().warning(f'No image has been saved')
+            return
+        # Draw a red circle in the center
+        center = (self.cv_image.shape[1] // 2, self.cv_image.shape[0] // 2)
+        cv2.circle(self.cv_image, center, 50, (0, 0, 255), 3)
+
+        cv2.namedWindow(f'marker-{id}', cv2.WINDOW_AUTOSIZE)  
+        # Show the image
+        cv2.imshow(f'marker-{id}', self.cv_image)
+        cv2.waitKey(30)
+
+        # Convert back to ROS Image and publish
+        out_msg = self.bridge.cv2_to_imgmsg(self.cv_image, encoding='bgr8')
+        out_msg.header = self.header  # preserve original header
+        self.image_pub.publish(out_msg)
         
     def rotate_360(self, angular_speed):
         """
         First, the robot rotates 360 degrees to detect all the markers around itself. 
         Then it performs individual detections, starting from the marker with the lowest ID. For each marker, the robot rotates clockwise or counterclockwise, 
         depending on the shortest path to align with the marker, stopping when the marker is centered in the camera. Using the OpenCV library, a circle is drawn 
-        around the marker. The robot then returns to its starting position before proceeding to the next marker, and repeats this process for all remaining markers
+        around the marker. The robot then proced to the next marker, and repeats this process for all remaining markers
         """
         
         self.get_logger().info('Waiting for first odom message...')
@@ -130,7 +169,7 @@ class ScanMarkers(Node):
         except Exception:
             return
 
-        time.sleep(5)    
+        time.sleep(5)
         
         try:
             threshold = 0.1     # Threshold for aligning the robot with the marker (rads)
@@ -143,6 +182,7 @@ class ScanMarkers(Node):
                     delta = normalize_angle(marker_yaw - self.yaw)
                     if abs(delta) <= threshold:
                         self.get_logger().info(f'Marker {lowest_id} detected, yaw={math.degrees(self.yaw):.1f}°')
+                        self.draw_circle(lowest_id)
                         break    
                                     
                     twist.angular.z = angular_speed if delta > 0.0 else -angular_speed
@@ -152,7 +192,7 @@ class ScanMarkers(Node):
                 twist.angular.z = 0.0
                 self._safe_publish(twist)
                 self.markers.pop(lowest_id)
-                time.sleep(2)
+                time.sleep(5)
         except KeyboardInterrupt:
             self.get_logger().info('Interrupted during alignment.')
             return
@@ -166,6 +206,8 @@ def main(args=None):
     finally:
         try:
             node.destroy_node()
+            input("Press a key to end up")
+            cv2.destroyAllWindows()
         except Exception:
             pass
 
