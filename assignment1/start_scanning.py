@@ -7,23 +7,20 @@ import math
 import time
 
 def quaternion_to_yaw(x, y, z, w):
-    """Convert quaternion to yaw (rotation around Z axis)."""
+    """Convert quaternion to yaw (rotation around Z axis)"""
     return math.atan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
 
 def normalize_angle(angle):
-    """Normalizza l'angolo in [-pi, pi]."""
+    """Normalize the angle between [-pi, pi]"""
     return math.atan2(math.sin(angle), math.cos(angle))
-
-def angle_difference(a, b):
-        """Differenza normalizzata a - b (risultato in [-pi, pi])."""
-        return normalize_angle(a - b)
 
 class ScanMarkers(Node):
     def __init__(self):
         super().__init__('scan_markers')
         self.vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.markers = {} # id marker -> yaw robot position
-        self.yaw = None
+        self.markers = {}                                               # [id marker] = Robot's angle after detecting the marker
+        self.yaw = None                                                 # Current robot yaw orientation
+        self.expected_markers = 5                                       # Number of markes expected
         self.odom_sub = self.create_subscription(
             Odometry,
             '/odom',
@@ -33,48 +30,63 @@ class ScanMarkers(Node):
         self.markers_sub = self.create_subscription(
             ArucoDetection,
             '/aruco_detections',
-            self.markers_detection,
+            self.marker_detection,
             10
         )
         
     def odom(self, msg):
+        """Perform the robot yaw orientation"""
         q = msg.pose.pose.orientation
         self.yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
         #self.get_logger().info(f'Current yaw: {math.degrees(self.yaw):.2f}°')
         
-    def markers_detection(self, msg):
+    def marker_detection(self, msg):
+        """
+        Perform the marker detection by retrieving the ID and position. Calculate the angle of the camera between the x-axis and z-axis, 
+        then determine the normalized global yaw. Compute the score as the absolute value of the camera angle. 
+        Update the dictionary continuously, keeping the entry with the lowest score, which indicates that the marker is centered in the camera view
+        """
         if not msg.markers or self.yaw is None:
             return
     
         for marker in msg.markers:
-            marker_id = int(marker.marker_id)
-            # controllare se non è già presente in modo da non sovrascrivere       
+            marker_id = int(marker.marker_id)     
             px = marker.pose.position.x
             py = marker.pose.position.y
             pz = marker.pose.position.z
-
             if px == 0 and py == 0 and pz == 0:
                 continue
             
             angle_cam = math.atan2(px, pz)
-            
             camera_mounting_offset = 0.0
             global_yaw = normalize_angle(self.yaw + angle_cam + camera_mounting_offset)
-            score = abs(angle_cam)  # più piccolo = più centrato
+            score = abs(angle_cam)  # smaller = more centered
 
             prev = self.markers.get(marker_id)
-            # tieni la stima migliore (più centrata)
+            # Keep the best estimation
             if prev is None or score < prev[1]:
                 self.markers[marker_id] = (global_yaw, score)
                 #self.get_logger().info(f'Best pose for marker {marker_id} updated: angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
+                
+    def _safe_publish(self, twist):
+        """Publish twist only if context still valid"""
+        try:
+            if rclpy.ok():
+                self.vel_pub.publish(twist)
+        except Exception as e:
+            self.get_logger().warning(f'Publish failed: {e}')
         
     def rotate_360(self, angular_speed):
         """
-        Rotate approx 360 degrees using time = angle/speed.
-        angular_speed: rad/s (positive -> counter-clockwise)
+        First, the robot rotates 360 degrees to detect all the markers around itself. 
+        Then it performs individual detections, starting from the marker with the lowest ID. For each marker, the robot rotates clockwise or counterclockwise, 
+        depending on the shortest path to align with the marker, stopping when the marker is centered in the camera. Using the OpenCV library, a circle is drawn 
+        around the marker. The robot then returns to its starting position before proceeding to the next marker, and repeats this process for all remaining markers
         """
         
         self.get_logger().info('Waiting for first odom message...')
+        
+        # Wait 10 seconds or until self.yaw is inizialized
         wait_count = 0
         while self.yaw is None and wait_count < 200:  # ad es. 200 * 0.05 = 10s timeout
             rclpy.spin_once(self, timeout_sec=0.05)
@@ -83,66 +95,67 @@ class ScanMarkers(Node):
         if self.yaw is None:
             self.get_logger().error('No odom received, aborting.')
             return
-            
+        
         twist = Twist()
         twist.linear.x = 0.0
         twist.angular.z = angular_speed
         self.get_logger().info(f'Rotation begin: speed={angular_speed:.3f} rad/s')
         
-        start_yaw = self.yaw
+        last_yaw = self.yaw
+        cumulative_rotation = 0.0
         try:
-            while (len(self.markers) != 5 or abs(start_yaw - self.yaw) >= 0.1):
-                self.vel_pub.publish(twist)
-                rclpy.spin_once(self, timeout_sec=0.0)
+            # Keep turning until the markers detected are five and he performed a whole 360°
+            while (len(self.markers) < self.expected_markers) or (cumulative_rotation < (2.0 * math.pi - 0.1)):
+                twist.angular.z = angular_speed
+                self._safe_publish(twist)
+
+                # lascia tempo per ricevere messaggi
+                rclpy.spin_once(self, timeout_sec=0.05)
+
+                # aggiorna integrazione dell'angolo (gestisce wrapping)
+                if self.yaw is not None:
+                    delta = normalize_angle(self.yaw - last_yaw)
+                    cumulative_rotation += abs(delta)
+                    last_yaw = self.yaw
         except KeyboardInterrupt:
-            twist.angular.z = 0.0
-            self.vel_pub.publish(twist)
             self.get_logger().info('Interrupted during rotation.')
-            pass
+            return
 
         twist.angular.z = 0.0
-        self.vel_pub.publish(twist)
+        self._safe_publish(twist)
         self.get_logger().info('SCANNING COMPLETED!')
         
         try:
             self.destroy_subscription(self.markers_sub)
         except Exception:
-            pass
+            return
 
-
-        time.sleep(5)        
+        time.sleep(5)    
+        
         try:
-            threshold = 0.1
+            threshold = 0.1     # Threshold for aligning the robot with the marker (rads)
             while len(self.markers) != 0:
                 lowest_id = min(self.markers.keys())
                 marker_yaw = self.markers[lowest_id][0]
                 self.get_logger().info(f'Aligning to marker {lowest_id} (target yaw={math.degrees(marker_yaw):.1f}°)')
-                
-                twist.angular.z = angular_speed
                 while True:
                     rclpy.spin_once(self, timeout_sec=0.01)
-                    
-                    delta = normalize_angle(marker_yaw - self.yaw)  # target - current
+                    delta = normalize_angle(marker_yaw - self.yaw)
                     if abs(delta) <= threshold:
-                        break
-                    
-                    #if (abs(self.yaw - marker_yaw) <= threshold):
-                    #    break
-                    
+                        self.get_logger().info(f'Marker {lowest_id} detected, yaw={math.degrees(self.yaw):.1f}°')
+                        break    
+                                    
                     twist.angular.z = angular_speed if delta > 0.0 else -angular_speed
-                    self.vel_pub.publish(twist)
-                    self.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')                    
+                    self._safe_publish(twist)
+                    #Sself.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')                    
                     
                 twist.angular.z = 0.0
-                self.vel_pub.publish(twist)
-                self.get_logger().info(f'Marker {lowest_id} passed, yaw={math.degrees(self.yaw):.1f}°')
+                self._safe_publish(twist)
                 self.markers.pop(lowest_id)
                 time.sleep(2)
         except KeyboardInterrupt:
-            twist.angular.z = 0.0
-            self.vel_pub.publish(twist)
             self.get_logger().info('Interrupted during alignment.')
-            pass
+            return
         print("TASK COMPLETED!")
         
 def main(args=None):
@@ -151,8 +164,16 @@ def main(args=None):
     try:
         node.rotate_360(angular_speed=0.25)
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     main()
