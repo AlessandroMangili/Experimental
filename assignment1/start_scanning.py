@@ -8,6 +8,7 @@ import time
 from cv_bridge import CvBridge
 import cv2
 from sensor_msgs.msg import Image
+import numpy as np
 
 def quaternion_to_yaw(x, y, z, w):
     """Convert quaternion to yaw (rotation around Z axis)"""
@@ -38,7 +39,7 @@ class ScanMarkers(Node):
             ArucoDetection,
             '/aruco_detections',
             self.marker_detection,
-            10
+            100
         )
         self.image_sub = self.create_subscription(                      # Subscriber to the original camera topic
             Image, 
@@ -51,7 +52,7 @@ class ScanMarkers(Node):
         """Perform the robot yaw orientation"""
         q = msg.pose.pose.orientation
         self.yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
-        #self.get_logger().info(f'Current yaw: {math.degrees(self.yaw):.2f}°')
+        self.get_logger().info(f'Current yaw: {math.degrees(self.yaw):.2f}°')
         
     def marker_detection(self, msg):
         """
@@ -79,7 +80,7 @@ class ScanMarkers(Node):
             # Keep the best estimation
             if prev is None or score < prev[1]:
                 self.markers[marker_id] = (global_yaw, score)
-                #self.get_logger().info(f'Best pose for marker {marker_id} updated: angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
+                self.get_logger().info(f'Best pose for marker {marker_id} updated: robot={self.yaw} position={global_yaw} angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
                 
     def image_callback(self, msg):
         try:
@@ -101,14 +102,33 @@ class ScanMarkers(Node):
         if self.cv_image is None:
             self.get_logger().warning(f'No image has been saved')
             return
-        # Draw a red circle in the center
-        center = (self.cv_image.shape[1] // 2, self.cv_image.shape[0] // 2)
-        cv2.circle(self.cv_image, center, 50, (0, 0, 255), 3)
-
-        cv2.namedWindow(f'marker-{id}', cv2.WINDOW_AUTOSIZE)  
+        
+        cv2.namedWindow(f'marker-{id}', cv2.WINDOW_AUTOSIZE)
+        
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
+        parameters = cv2.aruco.DetectorParameters_create()
+        # detectMarkers -> corners, ids, rejectedCandidates
+        corners, ids, rejected = cv2.aruco.detectMarkers(self.cv_image, aruco_dict, parameters=parameters)
+        if ids is None or len(ids) == 0:
+            print("No Aruco markers detected.")
+        else:
+            for i, c in enumerate(corners):
+                marker_id = int(ids[i][0])
+                pts = c.reshape((4, 2))
+                center = pts.mean(axis=0)
+                dists = np.linalg.norm(pts - center, axis=1)
+                radius = int(np.ceil(dists.max()))
+                center_int = (int(round(center[0])), int(round(center[1])))
+                
+                # Draw the red circle
+                cv2.circle(self.cv_image, center_int, radius, (0, 0, 255), 2)
+                # Draw a little dot in the middle of the marker
+                cv2.circle(self.cv_image, center_int, 3, (0, 0, 255), -1)
+                # Set the id above the marker
+                cv2.putText(self.cv_image, f'ID={marker_id}',(center_int[0], center_int[1] + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
         # Show the image
         cv2.imshow(f'marker-{id}', self.cv_image)
-        cv2.waitKey(30)
+        cv2.waitKey(20)
 
         # Convert back to ROS Image and publish
         out_msg = self.bridge.cv2_to_imgmsg(self.cv_image, encoding='bgr8')
@@ -142,10 +162,10 @@ class ScanMarkers(Node):
         
         last_yaw = self.yaw
         cumulative_rotation = 0.0
+        twist.angular.z = angular_speed
         try:
             # Keep turning until the markers detected are five and he performed a whole 360°
-            while (len(self.markers) < self.expected_markers) or (cumulative_rotation < (2.0 * math.pi - 0.1)):
-                twist.angular.z = angular_speed
+            while (len(self.markers) < self.expected_markers) or (cumulative_rotation < (2.0 * math.pi)):
                 self._safe_publish(twist)
 
                 # lascia tempo per ricevere messaggi
@@ -169,30 +189,30 @@ class ScanMarkers(Node):
         except Exception:
             return
 
-        time.sleep(5)
+        time.sleep(3)
         
         try:
-            threshold = 0.1     # Threshold for aligning the robot with the marker (rads)
+            threshold = 0.02     # Threshold for aligning the robot with the marker (rads)
             while len(self.markers) != 0:
                 lowest_id = min(self.markers.keys())
                 marker_yaw = self.markers[lowest_id][0]
                 self.get_logger().info(f'Aligning to marker {lowest_id} (target yaw={math.degrees(marker_yaw):.1f}°)')
                 while True:
                     rclpy.spin_once(self, timeout_sec=0.01)
+                    cv2.waitKey(1)
                     delta = normalize_angle(marker_yaw - self.yaw)
                     if abs(delta) <= threshold:
-                        self.get_logger().info(f'Marker {lowest_id} detected, yaw={math.degrees(self.yaw):.1f}°')
-                        self.draw_circle(lowest_id)
                         break    
                                     
                     twist.angular.z = angular_speed if delta > 0.0 else -angular_speed
                     self._safe_publish(twist)
-                    #Sself.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')                    
-                    
+                    self.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')                    
                 twist.angular.z = 0.0
                 self._safe_publish(twist)
+                self.get_logger().info(f'Marker {lowest_id} detected, yaw={math.degrees(self.yaw):.1f}°')
+                self.draw_circle(lowest_id)
                 self.markers.pop(lowest_id)
-                time.sleep(5)
+                time.sleep(2)
         except KeyboardInterrupt:
             self.get_logger().info('Interrupted during alignment.')
             return
@@ -206,7 +226,7 @@ def main(args=None):
     finally:
         try:
             node.destroy_node()
-            input("Press a key to end up")
+            input("Press a key to end up and kill all the windows")
             cv2.destroyAllWindows()
         except Exception:
             pass
