@@ -10,6 +10,8 @@ import cv2
 from sensor_msgs.msg import Image
 import numpy as np
 
+DEBUG = False
+
 def quaternion_to_yaw(x, y, z, w):
     """Convert quaternion to yaw (rotation around Z axis)"""
     return math.atan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
@@ -18,12 +20,23 @@ def normalize_angle(angle):
     """Normalize the angle between [-pi, pi]"""
     return math.atan2(math.sin(angle), math.cos(angle))
 
+def is_centered_pixel(center, img_shape, pixel_thresh=9):
+    """Check if the marker's center is centered in the camera view"""
+    h, w = img_shape[:2]
+    cx_img, cy_img = w/2.0, h/2.0
+    dx = center[0] - cx_img
+    dy = center[1] - cy_img
+    return abs(dx) <= pixel_thresh and abs(dy) <= pixel_thresh, dx, dy
+            
+
 class ScanMarkers(Node):
     def __init__(self):
         super().__init__('scan_markers')
         self.markers = {}                                               # [id marker] = Robot's angle after detecting the marker
+        self.centered_counts = {}                                       # [id_marker] = number of consecutive frames centered
         self.yaw = None                                                 # Current robot yaw orientation
-        self.expected_markers = 5                                       # Number of markes expected
+        self.EXCPECTED_MARKERS = 5                                      # Number of markes expected
+        self.REQUIRED_CONSECUTIVE = 3                                   # Number of consecutive frames to ensure the marker is centered
         self.bridge = CvBridge()
         self.cv_image = None                                            # Used to save the image already converted into a cv image
         self.header = None
@@ -52,7 +65,8 @@ class ScanMarkers(Node):
         """Perform the robot yaw orientation"""
         q = msg.pose.pose.orientation
         self.yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
-        self.get_logger().info(f'Current yaw: {math.degrees(self.yaw):.2f}°')
+        if DEBUG:
+            self.get_logger().info(f'Current yaw: {math.degrees(self.yaw):.2f}°')
         
     def marker_detection(self, msg):
         """
@@ -74,15 +88,17 @@ class ScanMarkers(Node):
             angle_cam = math.atan2(px, pz)
             camera_mounting_offset = 0.0
             global_yaw = normalize_angle(self.yaw + angle_cam + camera_mounting_offset)
-            score = abs(angle_cam)  # smaller = more centered
+            score = abs(angle_cam)      # smaller = more centered
 
             prev = self.markers.get(marker_id)
             # Keep the best estimation
             if prev is None or score < prev[1]:
                 self.markers[marker_id] = (global_yaw, score)
-                self.get_logger().info(f'Best pose for marker {marker_id} updated: robot={self.yaw} position={global_yaw} angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
+                if DEBUG:
+                    self.get_logger().info(f'Best pose for marker {marker_id} updated: robot={self.yaw} position={global_yaw} angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
                 
     def image_callback(self, msg):
+        """Convert and save the picture into an opencv image"""
         try:
             # Convert ROS Image to OpenCV image
             self.cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -90,7 +106,7 @@ class ScanMarkers(Node):
         except Exception as e:
             self.get_logger().error(f'cv_bridge exception: {e}')
                 
-    def _safe_publish(self, twist):
+    def safe_publish(self, twist):
         """Publish twist only if context still valid"""
         try:
             if rclpy.ok():
@@ -99,18 +115,17 @@ class ScanMarkers(Node):
             self.get_logger().warning(f'Publish failed: {e}')
             
     def draw_circle(self, id):
+        """Draw a circle around the marker so that it passes through the corners"""
         if self.cv_image is None:
             self.get_logger().warning(f'No image has been saved')
             return
-        
         cv2.namedWindow(f'marker-{id}', cv2.WINDOW_AUTOSIZE)
-        
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
         parameters = cv2.aruco.DetectorParameters_create()
         # detectMarkers -> corners, ids, rejectedCandidates
         corners, ids, rejected = cv2.aruco.detectMarkers(self.cv_image, aruco_dict, parameters=parameters)
         if ids is None or len(ids) == 0:
-            print("No Aruco markers detected.")
+            self.get_logger().warning(f'No Aruco markers detected')
         else:
             for i, c in enumerate(corners):
                 marker_id = int(ids[i][0])
@@ -119,7 +134,6 @@ class ScanMarkers(Node):
                 dists = np.linalg.norm(pts - center, axis=1)
                 radius = int(np.ceil(dists.max()))
                 center_int = (int(round(center[0])), int(round(center[1])))
-                
                 # Draw the red circle
                 cv2.circle(self.cv_image, center_int, radius, (0, 0, 255), 2)
                 # Draw a little dot in the middle of the marker
@@ -135,6 +149,36 @@ class ScanMarkers(Node):
         out_msg.header = self.header  # preserve original header
         self.image_pub.publish(out_msg)
         
+    def set_marker_center(self, target_marker_id):
+        """Determine if the marker with the given target_id is centered in the camera view"""
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
+        parameters = cv2.aruco.DetectorParameters_create()
+        corners, ids, rejected = cv2.aruco.detectMarkers(self.cv_image, aruco_dict, parameters=parameters)
+        if ids is None or len(ids) == 0:
+            return False
+        else:
+            for i, c in enumerate(corners):
+                marker_id = int(ids[i][0])
+                if target_marker_id != marker_id:
+                    continue
+                pts = c.reshape((4, 2))
+                center = pts.mean(axis=0)
+                centered_px, dx, dy = is_centered_pixel(center, self.cv_image.shape, pixel_thresh=9)
+                                        
+                if centered_px:
+                    self.centered_counts[marker_id] = self.centered_counts.get(marker_id, 0) + 1                            
+                else:
+                    self.centered_counts[marker_id] = 0
+
+                if self.centered_counts[marker_id] >= self.REQUIRED_CONSECUTIVE:
+                    if DEBUG:
+                        print(f"Marker {marker_id} CENTERED (frames={self.centered_counts[marker_id]})")
+                        cv2.namedWindow(f'marker-{marker_id}-p', cv2.WINDOW_AUTOSIZE)
+                        cv2.imshow(f'marker-{marker_id}-p', self.cv_image)
+                        cv2.waitKey(20)
+                    return True
+            return False
+        
     def rotate_360(self, angular_speed):
         """
         First, the robot rotates 360 degrees to detect all the markers around itself. 
@@ -147,7 +191,7 @@ class ScanMarkers(Node):
         
         # Wait 10 seconds or until self.yaw is inizialized
         wait_count = 0
-        while self.yaw is None and wait_count < 200:  # ad es. 200 * 0.05 = 10s timeout
+        while self.yaw is None and wait_count < 200:
             rclpy.spin_once(self, timeout_sec=0.05)
             wait_count += 1
             
@@ -165,13 +209,11 @@ class ScanMarkers(Node):
         twist.angular.z = angular_speed
         try:
             # Keep turning until the markers detected are five and he performed a whole 360°
-            while (len(self.markers) < self.expected_markers) or (cumulative_rotation < (2.0 * math.pi)):
-                self._safe_publish(twist)
-
-                # lascia tempo per ricevere messaggi
+            while (len(self.markers) < self.EXCPECTED_MARKERS) or (cumulative_rotation < (2.0 * math.pi)):
+                self.safe_publish(twist)
                 rclpy.spin_once(self, timeout_sec=0.05)
-
-                # aggiorna integrazione dell'angolo (gestisce wrapping)
+                if DEBUG:
+                    cv2.waitKey(1)
                 if self.yaw is not None:
                     delta = normalize_angle(self.yaw - last_yaw)
                     cumulative_rotation += abs(delta)
@@ -181,7 +223,7 @@ class ScanMarkers(Node):
             return
 
         twist.angular.z = 0.0
-        self._safe_publish(twist)
+        self.safe_publish(twist)
         self.get_logger().info('SCANNING COMPLETED!')
         
         try:
@@ -192,11 +234,36 @@ class ScanMarkers(Node):
         time.sleep(3)
         
         try:
+            while len(self.markers) != 0:
+                lowest_marker_id = min(self.markers.keys())
+                marker_yaw = self.markers[lowest_marker_id][0]
+                self.get_logger().info(f'Aligning to marker {lowest_marker_id} (target yaw={math.degrees(marker_yaw):.1f}°)')
+                delta = normalize_angle(marker_yaw - self.yaw)
+                twist.angular.z = angular_speed if delta > 0.0 else -angular_speed
+                while True:
+                    rclpy.spin_once(self, timeout_sec=0.01)
+                    cv2.waitKey(1)
+                    
+                    if self.set_marker_center(lowest_marker_id):
+                        break  
+                    
+                    self.safe_publish(twist)                   
+                twist.angular.z = 0.0
+                self.safe_publish(twist)
+                self.get_logger().info(f'Marker {lowest_marker_id} detected, yaw={math.degrees(self.yaw):.1f}°')
+                self.draw_circle(lowest_marker_id)
+                self.markers.pop(lowest_marker_id)
+                time.sleep(2)
+        except KeyboardInterrupt:
+            self.get_logger().info('Interrupted during alignment.')
+            return
+        
+        """try:
             threshold = 0.02     # Threshold for aligning the robot with the marker (rads)
             while len(self.markers) != 0:
-                lowest_id = min(self.markers.keys())
-                marker_yaw = self.markers[lowest_id][0]
-                self.get_logger().info(f'Aligning to marker {lowest_id} (target yaw={math.degrees(marker_yaw):.1f}°)')
+                lowest_marker_id = min(self.markers.keys())
+                marker_yaw = self.markers[lowest_marker_id][0]
+                self.get_logger().info(f'Aligning to marker {lowest_marker_id} (target yaw={math.degrees(marker_yaw):.1f}°)')
                 while True:
                     rclpy.spin_once(self, timeout_sec=0.01)
                     cv2.waitKey(1)
@@ -205,17 +272,18 @@ class ScanMarkers(Node):
                         break    
                                     
                     twist.angular.z = angular_speed if delta > 0.0 else -angular_speed
-                    self._safe_publish(twist)
-                    self.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')                    
+                    self.safe_publish(twist)
+                    #self.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')                    
                 twist.angular.z = 0.0
-                self._safe_publish(twist)
-                self.get_logger().info(f'Marker {lowest_id} detected, yaw={math.degrees(self.yaw):.1f}°')
-                self.draw_circle(lowest_id)
-                self.markers.pop(lowest_id)
+                self.safe_publish(twist)
+                self.get_logger().info(f'Marker {lowest_marker_id} detected, yaw={math.degrees(self.yaw):.1f}°')
+                self.draw_circle(lowest_marker_id)
+                self.markers.pop(lowest_marker_id)
                 time.sleep(2)
         except KeyboardInterrupt:
             self.get_logger().info('Interrupted during alignment.')
             return
+        """
         print("TASK COMPLETED!")
         
 def main(args=None):
@@ -226,7 +294,11 @@ def main(args=None):
     finally:
         try:
             node.destroy_node()
-            input("Press a key to end up and kill all the windows")
+            print('Press the key "q" while the focus is on one of the pictures to quit the program')
+            while True:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'): 
+                    break
             cv2.destroyAllWindows()
         except Exception:
             pass

@@ -5,7 +5,6 @@ from ament_index_python.packages import get_package_share_directory
 import os
 
 def generate_launch_description():
-    # Include del launch che spawn del robot
     spawn_robot_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(
@@ -16,7 +15,6 @@ def generate_launch_description():
         )
     )
 
-    # Include del launch aruco
     aruco_tracker_launch = IncludeLaunchDescription(
         AnyLaunchDescriptionSource(
             os.path.join(
@@ -27,16 +25,14 @@ def generate_launch_description():
         )
     )
 
-    # Nodo start_scanning in un nuovo terminale
     start_scanning_terminal = ExecuteProcess(
         cmd=[
-            'gnome-terminal', '--',  # apre un nuovo terminale (GNOME)
+            'gnome-terminal', '--',
             'ros2', 'run', 'assignment1', 'start_scanning'
         ],
         output='screen'
     )
 
-    # Sequenza usando TimerAction
     sequence = [
         spawn_robot_launch,
         LogInfo(msg='spawn_robot launched, scheduling aruco_tracker in 2s'),
