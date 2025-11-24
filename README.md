@@ -1,4 +1,4 @@
-# Scan aruco markers ROS2
+# Assignment1 ROS2
 
 This project allows a robot to detect ArUco markers using ROS2 and OpenCV, rotate to center them in the camera view, and visualize the detection in real-time.
 
@@ -80,6 +80,15 @@ This will print detailed information including:
 * Current robot yaw in degrees
 * Marker detection updates
 * Centering process for each marker
+
+## Optional: Four-wheel `skid_steer` models and world placement
+
+If you prefer to use a four-wheel skid-steer robot instead of the default two-wheel configuration (mogi_bot base), this repository also includes two `skid_steer` files that provide the alternative robot model and associated configuration. To use the four-wheel robot:
+
+* **Replace the mogi_bot base files**: copy the two `skid_steer` files into the `bme_gazebo_sensors` package and replace the corresponding mogi_bot base files.
+* **Add the Gazebo world to the `erl1` package**: place the provided world file inside the `erl1` package, under `erl1/worlds/`.
+
+These steps allow you to run the same marker-scanning behavior using a four-wheel skid-steer robot instead of the default two-wheel mogi_bot base.
 
 ## Customization
 
