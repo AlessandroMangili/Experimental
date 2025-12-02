@@ -85,17 +85,22 @@ class ScanMarkers(Node):
             if px == 0 and py == 0 and pz == 0:
                 continue
             
-            angle_cam = math.atan2(px, pz)
-            camera_mounting_offset = 0.0
-            global_yaw = normalize_angle(self.yaw + angle_cam + camera_mounting_offset)
-            score = abs(angle_cam)      # smaller = more centered
+            try:
+                angle_cam = math.atan2(px, pz)
+                camera_mounting_offset = 0.0
+                global_yaw = normalize_angle(self.yaw + angle_cam + camera_mounting_offset)
+                score = abs(angle_cam)      # smaller = more centered
 
-            prev = self.markers.get(marker_id)
-            # Keep the best estimation
-            if prev is None or score < prev[1]:
-                self.markers[marker_id] = (global_yaw, score)
+                prev = self.markers.get(marker_id)
+                # Keep the best estimation
+                if prev is None or score < prev[1]:
+                    self.markers[marker_id] = (global_yaw, score)
+                    if DEBUG:
+                        self.get_logger().info(f'Best pose for marker {marker_id} updated: robot={self.yaw} position={global_yaw} angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
+            except Exception as e:
                 if DEBUG:
-                    self.get_logger().info(f'Best pose for marker {marker_id} updated: robot={self.yaw} position={global_yaw} angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
+                    self.get_logger().info(f'Exception raised by the marker detection: {e}')
+                continue
                 
     def image_callback(self, msg):
         """Convert and save the picture into an opencv image"""
@@ -104,81 +109,100 @@ class ScanMarkers(Node):
             self.cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             self.header = msg.header
         except Exception as e:
-            self.get_logger().error(f'cv_bridge exception: {e}')
+            self.get_logger().error(f'Exception raised by the image conversion: {e}')
                 
-    def safe_publish(self, twist):
+    def safe_publish(self, publisher, msg):
         """Publish twist only if context still valid"""
         try:
             if rclpy.ok():
-                self.vel_pub.publish(twist)
+                publisher.publish(msg)
         except Exception as e:
-            self.get_logger().warning(f'Publish failed: {e}')
+            self.get_logger().warning(f'Exception raised while publishing: {e}')
             
     def draw_circle(self, id):
         """Draw a circle around the marker so that it passes through the corners"""
         if self.cv_image is None:
             self.get_logger().warning(f'No image has been saved')
             return
-        cv2.namedWindow(f'marker-{id}', cv2.WINDOW_AUTOSIZE)
-        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
-        parameters = cv2.aruco.DetectorParameters_create()
-        # detectMarkers -> corners, ids, rejectedCandidates
-        corners, ids, rejected = cv2.aruco.detectMarkers(self.cv_image, aruco_dict, parameters=parameters)
-        if ids is None or len(ids) == 0:
-            self.get_logger().warning(f'No Aruco markers detected')
-        else:
-            for i, c in enumerate(corners):
-                marker_id = int(ids[i][0])
-                pts = c.reshape((4, 2))
-                center = pts.mean(axis=0)
-                dists = np.linalg.norm(pts - center, axis=1)
-                radius = int(np.ceil(dists.max()))
-                center_int = (int(round(center[0])), int(round(center[1])))
-                # Draw the red circle
-                cv2.circle(self.cv_image, center_int, radius, (0, 0, 255), 2)
-                # Draw a little dot in the middle of the marker
-                cv2.circle(self.cv_image, center_int, 3, (0, 0, 255), -1)
-                # Set the id above the marker
-                cv2.putText(self.cv_image, f'ID={marker_id}',(center_int[0], center_int[1] + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-        # Show the image
-        cv2.imshow(f'marker-{id}', self.cv_image)
-        cv2.waitKey(20)
+        
+        try:
+            cv2.namedWindow(f'marker-{id}', cv2.WINDOW_AUTOSIZE)
+            aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
+            parameters = cv2.aruco.DetectorParameters_create()
+            # detectMarkers -> corners, ids, rejectedCandidates
+            corners, ids, rejected = cv2.aruco.detectMarkers(self.cv_image, aruco_dict, parameters=parameters)
+            if ids is None or len(ids) == 0:
+                self.get_logger().warning(f'No Aruco markers detected')
+            else:
+                for i, c in enumerate(corners):
+                    marker_id = int(ids[i][0])
+                    pts = c.reshape((4, 2))
+                    center = pts.mean(axis=0)
+                    dists = np.linalg.norm(pts - center, axis=1)
+                    radius = int(np.ceil(dists.max()))
+                    center_int = (int(round(center[0])), int(round(center[1])))
+                    # Draw the red circle
+                    cv2.circle(self.cv_image, center_int, radius, (0, 0, 255), 2)
+                    # Draw a little dot in the middle of the marker
+                    cv2.circle(self.cv_image, center_int, 3, (0, 0, 255), -1)
+                    # Set the id above the marker
+                    cv2.putText(self.cv_image, f'ID={marker_id}',(center_int[0], center_int[1] + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+            # Show the image
+            cv2.imshow(f'marker-{id}', self.cv_image)
+            cv2.waitKey(20)
+        except Exception as e:
+            self.get_logger().error(f'Exception raised by the draw circle: {e}')
+            return
 
         # Convert back to ROS Image and publish
-        out_msg = self.bridge.cv2_to_imgmsg(self.cv_image, encoding='bgr8')
+        try:
+            out_msg = self.bridge.cv2_to_imgmsg(self.cv_image, encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'Exception raised while image conversion: {e}')
+            return
         out_msg.header = self.header  # preserve original header
-        self.image_pub.publish(out_msg)
+        self.safe_publish(self.image_pub, out_msg)
         
     def set_marker_center(self, target_marker_id):
         """Determine if the marker with the given target_id is centered in the camera view"""
-        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
-        parameters = cv2.aruco.DetectorParameters_create()
-        corners, ids, rejected = cv2.aruco.detectMarkers(self.cv_image, aruco_dict, parameters=parameters)
-        if ids is None or len(ids) == 0:
-            return False
-        else:
-            for i, c in enumerate(corners):
-                marker_id = int(ids[i][0])
-                if target_marker_id != marker_id:
-                    continue
-                pts = c.reshape((4, 2))
-                center = pts.mean(axis=0)
-                centered_px, dx, dy = is_centered_pixel(center, self.cv_image.shape, pixel_thresh=9)
-                                        
-                if centered_px:
-                    self.centered_counts[marker_id] = self.centered_counts.get(marker_id, 0) + 1                            
-                else:
-                    self.centered_counts[marker_id] = 0
+        try:
+            aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
+            parameters = cv2.aruco.DetectorParameters_create()
+            corners, ids, rejected = cv2.aruco.detectMarkers(self.cv_image, aruco_dict, parameters=parameters)
+            if ids is None or len(ids) == 0:
+                if DEBUG:
+                    self.get_logger().warning(f'No cornerns has been detected')
+                return False
+            else:
+                for i, c in enumerate(corners):
+                    marker_id = int(ids[i][0])
+                    if target_marker_id != marker_id:
+                        continue
+                    pts = c.reshape((4, 2))
+                    center = pts.mean(axis=0)
+                    centered_px, dx, dy = is_centered_pixel(center, self.cv_image.shape, pixel_thresh=9)
+                                            
+                    if centered_px:
+                        self.centered_counts[marker_id] = self.centered_counts.get(marker_id, 0) + 1
+                        if DEBUG:
+                            self.get_logger().warning(f'Frames: {self.centered_counts[marker_id]} centered for marker: {marker_id}')     
+                    else:
+                        self.centered_counts[marker_id] = 0
+                        if DEBUG:
+                            self.get_logger().warning(f'Initialized frames to zero for marker: {marker_id}')
 
-                if self.centered_counts[marker_id] >= self.REQUIRED_CONSECUTIVE:
-                    if DEBUG:
-                        print(f"Marker {marker_id} CENTERED (frames={self.centered_counts[marker_id]})")
-                        cv2.namedWindow(f'marker-{marker_id}-p', cv2.WINDOW_AUTOSIZE)
-                        cv2.imshow(f'marker-{marker_id}-p', self.cv_image)
-                        cv2.waitKey(20)
-                    return True
+                    if self.centered_counts[marker_id] >= self.REQUIRED_CONSECUTIVE:
+                        if DEBUG:
+                            print(f"Marker {marker_id} CENTERED (frames={self.centered_counts[marker_id]})")
+                            cv2.namedWindow(f'marker-{marker_id}-p', cv2.WINDOW_AUTOSIZE)
+                            cv2.imshow(f'marker-{marker_id}-p', self.cv_image)
+                            cv2.waitKey(20)
+                        return True
+                return False
+        except Exception as e:
+            self.get_logger().warning(f'Exception raised by the set marker center: {e}')
             return False
-        
+            
     def rotate_360(self, angular_speed):
         """
         First, the robot rotates 360 degrees to detect all the markers around itself. 
@@ -210,7 +234,7 @@ class ScanMarkers(Node):
         try:
             # Keep turning until the markers detected are five and he performed a whole 360°
             while (len(self.markers) < self.EXCPECTED_MARKERS) or (cumulative_rotation < (2.0 * math.pi)):
-                self.safe_publish(twist)
+                self.safe_publish(self.vel_pub, twist)
                 rclpy.spin_once(self, timeout_sec=0.05)
                 if DEBUG:
                     cv2.waitKey(1)
@@ -223,7 +247,7 @@ class ScanMarkers(Node):
             return
 
         twist.angular.z = 0.0
-        self.safe_publish(twist)
+        self.safe_publish(self.vel_pub, twist)
         self.get_logger().info('SCANNING COMPLETED!')
         
         try:
@@ -247,9 +271,9 @@ class ScanMarkers(Node):
                     if self.set_marker_center(lowest_marker_id):
                         break  
                     
-                    self.safe_publish(twist)                   
+                    self.safe_publish(self.vel_pub,twist)                   
                 twist.angular.z = 0.0
-                self.safe_publish(twist)
+                self.safe_publish(self.vel_pub, twist)
                 self.get_logger().info(f'Marker {lowest_marker_id} detected, yaw={math.degrees(self.yaw):.1f}°')
                 self.draw_circle(lowest_marker_id)
                 self.markers.pop(lowest_marker_id)
@@ -272,10 +296,10 @@ class ScanMarkers(Node):
                         break    
                                     
                     twist.angular.z = angular_speed if delta > 0.0 else -angular_speed
-                    self.safe_publish(twist)
+                    self.safe_publish(self.vel_pub, twist)
                     #self.get_logger().info(f'ROBOT {self.yaw} --------- MARKER {marker_yaw}')                    
                 twist.angular.z = 0.0
-                self.safe_publish(twist)
+                self.safe_publish(self.vel_pub, twist)
                 self.get_logger().info(f'Marker {lowest_marker_id} detected, yaw={math.degrees(self.yaw):.1f}°')
                 self.draw_circle(lowest_marker_id)
                 self.markers.pop(lowest_marker_id)
