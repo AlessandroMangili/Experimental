@@ -22,11 +22,10 @@ def normalize_angle(angle):
 
 def is_centered_pixel(center, img_shape, pixel_thresh=9):
     """Check if the marker's center is centered in the camera view"""
-    h, w = img_shape[:2]
-    cx_img, cy_img = w/2.0, h/2.0
+    _, w = img_shape[:2]
+    cx_img = w/2.0
     dx = center[0] - cx_img
-    dy = center[1] - cy_img
-    return abs(dx) <= pixel_thresh and abs(dy) <= pixel_thresh, dx, dy
+    return abs(dx) <= pixel_thresh
             
 
 class ScanMarkers(Node):
@@ -65,8 +64,6 @@ class ScanMarkers(Node):
         """Perform the robot yaw orientation"""
         q = msg.pose.pose.orientation
         self.yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
-        if DEBUG:
-            self.get_logger().info(f'Current yaw: {math.degrees(self.yaw):.2f}°')
         
     def marker_detection(self, msg):
         """
@@ -92,8 +89,10 @@ class ScanMarkers(Node):
                 score = abs(angle_cam)      # smaller = more centered
 
                 prev = self.markers.get(marker_id)
+                if prev is None:
+                    self.get_logger().info(f'Marker {marker_id} detected: {len(self.markers) + 1}/{self.EXCPECTED_MARKERS}')
                 # Keep the best estimation
-                if prev is None or score < prev[1]:
+                if prev is None or score < prev[1]:                    
                     self.markers[marker_id] = (global_yaw, score)
                     if DEBUG:
                         self.get_logger().info(f'Best pose for marker {marker_id} updated: robot={self.yaw} position={global_yaw} angle_cam={math.degrees(angle_cam):.1f}° score={score:.3f}')
@@ -177,23 +176,25 @@ class ScanMarkers(Node):
                 for i, c in enumerate(corners):
                     marker_id = int(ids[i][0])
                     if target_marker_id != marker_id:
+                        if DEBUG:
+                            self.get_logger().warning(f'Markers id not coincide with the target')
                         continue
                     pts = c.reshape((4, 2))
                     center = pts.mean(axis=0)
-                    centered_px, dx, dy = is_centered_pixel(center, self.cv_image.shape, pixel_thresh=9)
+                    centered_px = is_centered_pixel(center, self.cv_image.shape, pixel_thresh=9)
                                             
                     if centered_px:
                         self.centered_counts[marker_id] = self.centered_counts.get(marker_id, 0) + 1
                         if DEBUG:
-                            self.get_logger().warning(f'Frames: {self.centered_counts[marker_id]} centered for marker: {marker_id}')     
+                            self.get_logger().info(f'Frames {self.centered_counts[marker_id]}/{self.REQUIRED_CONSECUTIVE} centered for marker: {marker_id}')     
                     else:
                         self.centered_counts[marker_id] = 0
                         if DEBUG:
-                            self.get_logger().warning(f'Initialized frames to zero for marker: {marker_id}')
+                            self.get_logger().warning(f'Framed not centered for marker: {marker_id}')
 
                     if self.centered_counts[marker_id] >= self.REQUIRED_CONSECUTIVE:
                         if DEBUG:
-                            print(f"Marker {marker_id} CENTERED (frames={self.centered_counts[marker_id]})")
+                            self.get_logger().info(f"Marker {marker_id} CENTERED")
                             cv2.namedWindow(f'marker-{marker_id}-p', cv2.WINDOW_AUTOSIZE)
                             cv2.imshow(f'marker-{marker_id}-p', self.cv_image)
                             cv2.waitKey(20)
@@ -308,7 +309,7 @@ class ScanMarkers(Node):
             self.get_logger().info('Interrupted during alignment.')
             return
         """
-        print("TASK COMPLETED!")
+        self.get_logger().info("TASK COMPLETED!")
         
 def main(args=None):
     rclpy.init(args=args)
