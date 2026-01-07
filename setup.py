@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'start_scanning = assignment1.start_scanning:main',
+            'start_scanning_exam = assignment1.start_scanning_exam:main',
         ],
     },
 )

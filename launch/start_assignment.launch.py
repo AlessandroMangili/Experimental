@@ -28,7 +28,7 @@ def generate_launch_description():
     start_scanning_terminal = ExecuteProcess(
         cmd=[
             'gnome-terminal', '--',
-            'ros2', 'run', 'assignment1', 'start_scanning'
+            'ros2', 'run', 'assignment1', 'start_scanning_exam'
         ],
         output='screen'
     )
